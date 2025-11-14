@@ -601,13 +601,12 @@ async def get_config():
 async def get_prices(
     csv_file: UploadFile = File(..., description="CSV with 'coin' and 'address' columns"),
     target_date: str = Form("2025-10-31", description="Target date (YYYY-MM-DD)"),
-    api_key: Optional[str] = Form(None, description="(Optional) CMC API key"),
 ):
     """Main endpoint: returns CSV with prices"""
     logger.info(f"Processing price request for date: {target_date}")
     
     try:
-        api_key = api_key or _env_api_key()
+        api_key = _env_api_key()
     except RuntimeError as e:
         logger.error(f"API key error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -790,13 +789,12 @@ async def get_prices(
 async def get_prices_debug(
     csv_file: UploadFile = File(...),
     target_date: str = Form("2025-10-31"),
-    api_key: Optional[str] = Form(None),
 ):
     """Debug endpoint: returns JSON with complete processing details"""
     logger.info(f"Processing debug request for date: {target_date}")
     
     try:
-        api_key = api_key or _env_api_key()
+        api_key = _env_api_key()
     except RuntimeError as e:
         logger.error(f"API key error in debug endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
