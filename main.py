@@ -1,5 +1,5 @@
 """
-Coin Price Extractor - Simplified & Optimized v2.0.0
+Crypto Price Extractor
 
 FastAPI application for fetching historical cryptocurrency prices from CoinMarketCap.
 
@@ -12,17 +12,6 @@ Features:
 - Date validation and input checking
 - Debug endpoint for troubleshooting
 
-Optimizations applied:
-1. Retry logic: Exponential backoff for failed API calls (HTTP 429, 5xx errors)
-2. Error handling: Try-catch blocks around all API calls with detailed error messages
-3. Logging: Comprehensive logging at INFO/DEBUG levels for monitoring and troubleshooting
-4. Input validation: CSV format, date format, future date checking
-5. Batch processing: Configurable batch sizes with individual retry for missing items
-6. Environment-based config: All constants configurable via .env file
-7. Multi-chain address decoration: Auto-prefixing for Solana and other chains
-8. Dual price endpoint strategy: Quotes/historical → OHLCV/historical fallback
-9. Request timeouts: Configurable timeouts to prevent hanging
-10. Health & config endpoints: Monitor application status and settings
 
 Configuration via environment variables:
 - CMC_API_KEY (required)
@@ -38,7 +27,7 @@ from fastapi.responses import Response, JSONResponse
 import httpx, os, csv, logging, asyncio
 from io import StringIO
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -50,9 +39,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Coin Price Extractor - Simplified",
+    title="Crypto Price Extractor",
     version="2.0.0",
-    description="Lê 1 CSV com 'coin' e 'address', busca preços na CMC e retorna CSV."
+    description="Reads CSV with 'coin' and 'address' columns, fetches prices from CMC and returns CSV."
 )
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
@@ -94,7 +83,7 @@ async def _rate_limit():
 def _env_api_key() -> str:
     api_key = os.getenv(CMC_API_KEY_ENV, "").strip()
     if not api_key:
-        raise RuntimeError(f"Defina a variável de ambiente {CMC_API_KEY_ENV} com a sua API key da CoinMarketCap.")
+        raise RuntimeError(f"Please set the {CMC_API_KEY_ENV} environment variable with your CoinMarketCap API key.")
     return api_key
 
 
@@ -134,7 +123,7 @@ def _valid_address(addr: Optional[str]) -> bool:
 
 
 def _decorate_address_for_cmc(addr: str) -> str:
-    """EVM (0x) ou Solana (base58) com prefixo SOL:"""
+    """EVM (0x) or Solana (base58) with SOL: prefix"""
     a = addr.strip()
     if a.startswith("0x") and len(a) == 42:
         return a
@@ -145,23 +134,23 @@ def _decorate_address_for_cmc(addr: str) -> str:
 
 
 def _detect_network_slug(addr: str) -> str:
-    """Detecta a rede baseado no formato do endereço"""
+    """Detects network based on address format"""
     a = addr.strip()
     
-    # Ethereum e EVM chains (0x + 40 hex chars)
+    # Ethereum and EVM chains (0x + 40 hex chars)
     if a.startswith("0x") and len(a) == 42:
         return "ethereum"
     
-    # Solana (base58, ~32-44 chars, sem 0x)
+    # Solana (base58, ~32-44 chars, no 0x)
     if not a.startswith("0x") and 32 <= len(a) <= 44:
-        # Solana usa base58 alphabet
+        # Solana uses base58 alphabet
         return "solana"
     
     # Stellar (starts with G, ~56 chars)
     if a.startswith("G") and len(a) == 56:
         return "stellar"
     
-    # Default para ethereum se não identificado
+    # Default to ethereum if network cannot be identified
     logger.warning(f"Could not detect network for address {addr[:10]}..., defaulting to ethereum")
     return "ethereum"
 
@@ -217,12 +206,12 @@ async def _make_request_with_retry(
 
 
 async def map_address_to_cmc_ids(addresses: List[str], api_key: str) -> Dict[str, int]:
-    """Mapeia endereços -> CMC ID com retry logic (sem prefixo SOL:)"""
+    """Maps addresses to CMC IDs with retry logic (without SOL: prefix)"""
     logger.info(f"Mapping {len(addresses)} addresses to CMC IDs")
     mapping: Dict[str, int] = {}
     headers = {"X-CMC_PRO_API_KEY": api_key}
     addrs = [a for a in {a.strip(): None for a in addresses if _valid_address(a)}.keys()]
-    # NÃO decorar com SOL: para o endpoint /info - usar endereços raw
+    # Do NOT decorate with SOL: for the /info endpoint - use raw addresses
     pairs: List[Tuple[str, str]] = list(zip(addrs, addrs))
     
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -268,7 +257,7 @@ async def map_address_to_cmc_ids(addresses: List[str], api_key: str) -> Dict[str
 
 
 def _extract_ids_from_response(json_data: dict, mapping: Dict[str, int]):
-    """Extrai IDs dos contratos do payload CMC"""
+    """Extracts contract IDs from CMC response payload"""
     data = json_data.get("data", {})
     for payload in data.values():
         try:
@@ -285,7 +274,7 @@ def _extract_ids_from_response(json_data: dict, mapping: Dict[str, int]):
 
 
 async def map_symbol_to_cmc_ids(symbols: List[str], api_key: str) -> Dict[str, int]:
-    """Mapeia símbolo -> CMC ID (escolhe melhor rank) com retry logic"""
+    """Maps symbol to CMC ID (chooses best rank) with retry logic"""
     logger.info(f"Mapping {len(symbols)} symbols to CMC IDs")
     mapping: Dict[str, int] = {}
     best_rank: Dict[str, int] = {}
@@ -341,7 +330,7 @@ async def map_symbol_to_cmc_ids(symbols: List[str], api_key: str) -> Dict[str, i
 
 
 def _extract_symbols_from_response(json_data: dict, mapping: Dict[str, int], best_rank: Dict[str, int]):
-    """Extrai símbolos do payload CMC"""
+    """Extracts symbols from CMC response payload"""
     data = json_data.get("data")
     if data and isinstance(data, list):
         for item in data:
@@ -358,83 +347,81 @@ def _extract_symbols_from_response(json_data: dict, mapping: Dict[str, int], bes
 
 
 async def fetch_prices_for_ids(ids: List[int], date_end_utc: datetime, api_key: str) -> Dict[int, Optional[float]]:
-    """Busca preços históricos com fallback quotes → ohlcv e retry logic"""
-    logger.info(f"Fetching prices for {len(ids)} CMC IDs")
+    """Fetches historical prices with fallback quotes → ohlcv and retry logic"""
+    logger.info(f"Fetching prices for {len(ids)} CMC IDs on date: {date_end_utc.date()}")
     headers = {"X-CMC_PRO_API_KEY": api_key}
     results: Dict[int, Optional[float]] = {}
     if not ids:
         return results
 
     PRICE_BATCH = 100
-    time_start = datetime(date_end_utc.year, date_end_utc.month, date_end_utc.day, 0, 0, 0, tzinfo=timezone.utc)
-    time_end = datetime(date_end_utc.year, date_end_utc.month, date_end_utc.day, 23, 59, 59, tzinfo=timezone.utc)
+    # CMC API quirk: OHLCV endpoint needs the PREVIOUS day to get correct data
+    # When you request 2025-10-31, it returns 2025-11-01 data
+    # So we need to request one day earlier
+    adjusted_date = date_end_utc - timedelta(days=1)
+    
+    time_start = datetime(adjusted_date.year, adjusted_date.month, adjusted_date.day, 0, 0, 0, tzinfo=timezone.utc)
+    time_end = datetime(adjusted_date.year, adjusted_date.month, adjusted_date.day, 23, 59, 59, tzinfo=timezone.utc)
+    
+    logger.info(f"Requesting API data for adjusted date: {adjusted_date.date()} (will return data for {date_end_utc.date()})")
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         for i in range(0, len(ids), PRICE_BATCH):
             chunk = ids[i:i + PRICE_BATCH]
             logger.debug(f"Fetching prices for batch {i//PRICE_BATCH + 1}: {len(chunk)} IDs")
             
-            # 1) Try quotes/historical with retry
-            params = {
+            # Use OHLCV endpoint directly for accurate close prices
+            # The quotes/historical endpoint only returns snapshot prices, not close prices
+            params_ohlcv = {
                 "id": ",".join(str(x) for x in chunk),
-                "time_start": time_start.isoformat(),
-                "time_end": time_end.isoformat(),
-                "interval": "daily",
+                "time_start": time_start.date().isoformat(),  # YYYY-MM-DD format
+                "time_end": time_end.date().isoformat(),
                 "convert": "USD",
+                "interval": "daily",
             }
             
-            quotes_response = await _make_request_with_retry(
+            ohlcv_response = await _make_request_with_retry(
                 client,
                 "GET",
-                f"{CMC_BASE}/v2/cryptocurrency/quotes/historical",
+                f"{CMC_BASE}/v1/cryptocurrency/ohlcv/historical",
                 headers=headers,
-                params=params
+                params=params_ohlcv
             )
-
-            missing_ids: List[int] = []
-            if quotes_response:
-                for cid in chunk:
-                    quotes = quotes_response.get("data", {}).get(str(cid), {}).get("quotes") or []
-                    price_val = _extract_price_from_quotes(quotes, date_end_utc.date())
-                    
-                    if price_val is None:
-                        missing_ids.append(cid)
-                    else:
-                        results[cid] = price_val
-                logger.debug(f"Quotes endpoint returned {len(chunk) - len(missing_ids)} prices, {len(missing_ids)} missing")
-            else:
-                logger.warning("Quotes endpoint failed, trying OHLCV for all IDs in chunk")
-                missing_ids = list(chunk)
-
-            # 2) Fallback OHLCV with retry (v1 endpoint - correto conforme docs CMC)
-            if missing_ids:
-                params_ohlcv = {
-                    "id": ",".join(str(x) for x in missing_ids),
-                    "time_start": time_start.date().isoformat(),  # YYYY-MM-DD format
-                    "time_end": time_end.date().isoformat(),
-                    "convert": "USD",
-                    "interval": "daily",
-                }
-                
-                ohlcv_response = await _make_request_with_retry(
-                    client,
-                    "GET",
-                    f"{CMC_BASE}/v1/cryptocurrency/ohlcv/historical",  # v1, não v2!
-                    headers=headers,
-                    params=params_ohlcv
-                )
-                
-                if ohlcv_response:
-                    d2 = ohlcv_response.get("data", {})
-                    for cid in missing_ids:
-                        series = d2.get(str(cid), {}).get("quotes") or []
+            
+            if ohlcv_response:
+                d2 = ohlcv_response.get("data", {})
+                logger.debug(f"OHLCV response data keys: {list(d2.keys())}")
+                # OHLCV v1 returns data at top level for single ID, or nested for multiple IDs
+                # Check if it's a single ID response (has 'quotes' at top level)
+                if "quotes" in d2:
+                    # Single ID response: {"data": {"id": 1, "quotes": [...]}}
+                    for cid in chunk:
+                        series = d2.get("quotes") or []
+                        if series:
+                            logger.info(f"OHLCV: CMC ID {cid}, got {len(series)} quotes, first date: {series[0].get('time_open', 'N/A')[:10]}, looking for: {date_end_utc.date()}")
                         close_val = _extract_close_from_ohlcv(series, date_end_utc.date())
                         results[cid] = close_val
-                    logger.debug(f"OHLCV fallback completed for {len(missing_ids)} IDs")
+                        if close_val:
+                            logger.info(f"OHLCV: CMC ID {cid} extracted price: ${close_val}")
+                        else:
+                            logger.warning(f"OHLCV: CMC ID {cid} - no price extracted from {len(series)} quotes")
                 else:
-                    logger.warning(f"OHLCV fallback failed for {len(missing_ids)} IDs")
-                    for cid in missing_ids:
-                        results[cid] = None
+                    # Multiple ID response: {"data": {"1": {"quotes": [...]}, "1027": {...}}}
+                    for cid in chunk:
+                        cid_data = d2.get(str(cid), {})
+                        series = cid_data.get("quotes") or []
+                        if series:
+                            logger.info(f"OHLCV: CMC ID {cid}, got {len(series)} quotes, first date: {series[0].get('time_open', 'N/A')[:10]}, looking for: {date_end_utc.date()}")
+                        close_val = _extract_close_from_ohlcv(series, date_end_utc.date())
+                        results[cid] = close_val
+                        if close_val:
+                            logger.info(f"OHLCV: CMC ID {cid} extracted price: ${close_val}")
+                        else:
+                            logger.warning(f"OHLCV: CMC ID {cid} - no price extracted from {len(series)} quotes")
+            else:
+                logger.warning(f"OHLCV request failed for {len(chunk)} IDs")
+                for cid in chunk:
+                    results[cid] = None
 
     logger.info(f"Price fetch complete: {sum(1 for v in results.values() if v is not None)}/{len(results)} with prices")
     return results
@@ -446,8 +433,8 @@ async def fetch_dex_prices_for_addresses(
     api_key: str
 ) -> Dict[str, Optional[float]]:
     """
-    Tenta buscar preços de DEX para endereços que não foram encontrados como cryptoassets.
-    Usa a DEX API v4 da CoinMarketCap.
+    Attempts to fetch DEX prices for addresses not found as cryptoassets.
+    Uses CoinMarketCap DEX API v4.
     """
     logger.info(f"Trying DEX API for {len(addresses)} addresses")
     headers = {"X-CMC_PRO_API_KEY": api_key}
@@ -456,7 +443,7 @@ async def fetch_dex_prices_for_addresses(
     if not addresses:
         return results
     
-    # Para DEX, precisamos do formato YYYY-MM-DD
+    # For DEX, we need YYYY-MM-DD format
     target_date_str = date_end_utc.date().isoformat()
     
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -464,13 +451,13 @@ async def fetch_dex_prices_for_addresses(
             network_slug = _detect_network_slug(addr)
             addr_clean = addr.strip()
             
-            # Remove prefixo SOL: se tiver
+            # Remove SOL: prefix if present
             if addr_clean.upper().startswith("SOL:"):
                 addr_clean = addr_clean[4:]
             
             logger.debug(f"Trying DEX for address {addr_clean[:10]}... on network {network_slug}")
             
-            # Tenta buscar OHLCV histórico do par DEX
+            # Attempt to fetch historical OHLCV for the DEX pair
             params_dex = {
                 "contract_address": addr_clean,
                 "network_slug": network_slug,
@@ -489,7 +476,7 @@ async def fetch_dex_prices_for_addresses(
             )
             
             if dex_response and dex_response.get("data"):
-                # Extrai o close price do primeiro (e único) dia
+                # Extract close price from the first (and only) day
                 data = dex_response.get("data", {})
                 quotes = data.get("quotes", [])
                 if quotes:
@@ -511,19 +498,33 @@ async def fetch_dex_prices_for_addresses(
 
 
 def _extract_price_from_quotes(quotes: list, target_date) -> Optional[float]:
-    """Extrai preço das quotes, preferindo dia exato"""
+    """Extracts price from quotes, preferring exact day and using close price"""
     price_val = None
+    matching_quotes = []
+    
+    # Find all quotes that match the target date
     for q in quotes:
         try:
             ts = q.get("timestamp") or q.get("time_close") or q.get("time_open")
             if ts:
                 d = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).date()
                 if d == target_date:
-                    price_val = q.get("quote", {}).get("USD", {}).get("price")
+                    matching_quotes.append(q)
         except Exception:
             pass
-    if price_val is None and quotes:
-        price_val = quotes[-1].get("quote", {}).get("USD", {}).get("price")
+    
+    # If we found quotes for the target date, use the LAST one (end of day)
+    if matching_quotes:
+        last_quote = matching_quotes[-1]
+        # Try to get close price, fallback to regular price
+        price_val = (last_quote.get("quote", {}).get("USD", {}).get("close") or 
+                     last_quote.get("quote", {}).get("USD", {}).get("price"))
+    elif quotes:
+        # Fallback to last quote in the entire array
+        last_quote = quotes[-1]
+        price_val = (last_quote.get("quote", {}).get("USD", {}).get("close") or 
+                     last_quote.get("quote", {}).get("USD", {}).get("price"))
+    
     try:
         return float(price_val) if price_val is not None else None
     except Exception:
@@ -531,7 +532,7 @@ def _extract_price_from_quotes(quotes: list, target_date) -> Optional[float]:
 
 
 def _extract_close_from_ohlcv(series: list, target_date) -> Optional[float]:
-    """Extrai close do OHLCV, preferindo dia exato"""
+    """Extracts close from OHLCV, preferring exact day"""
     close_val = None
     for q in series:
         try:
@@ -598,11 +599,11 @@ async def get_config():
 
 @app.post("/prices")
 async def get_prices(
-    csv_file: UploadFile = File(..., description="CSV com colunas 'coin' e 'address'"),
-    target_date: str = Form("2025-10-31", description="Data alvo (YYYY-MM-DD)"),
-    api_key: Optional[str] = Form(None, description="(Opcional) CMC API key"),
+    csv_file: UploadFile = File(..., description="CSV with 'coin' and 'address' columns"),
+    target_date: str = Form("2025-10-31", description="Target date (YYYY-MM-DD)"),
+    api_key: Optional[str] = Form(None, description="(Optional) CMC API key"),
 ):
-    """Endpoint principal: retorna CSV com preços"""
+    """Main endpoint: returns CSV with prices"""
     logger.info(f"Processing price request for date: {target_date}")
     
     try:
@@ -620,16 +621,16 @@ async def get_prices(
         if dt_target > now:
             raise HTTPException(
                 status_code=400,
-                detail=f"Data {target_date} está no futuro. Use uma data passada (máximo: {now.date().isoformat()})."
+                detail=f"Date {target_date} is in the future. Use a past date (maximum: {now.date().isoformat()})."
             )
     except ValueError:
         logger.error(f"Invalid date format: {target_date}")
-        raise HTTPException(status_code=400, detail="Parâmetro target_date inválido. Use YYYY-MM-DD.")
+        raise HTTPException(status_code=400, detail="Invalid target_date parameter. Use YYYY-MM-DD format.")
 
     # Validate file upload
     if not csv_file.filename:
         logger.error("No filename in uploaded file")
-        raise HTTPException(status_code=400, detail="Arquivo CSV não fornecido.")
+        raise HTTPException(status_code=400, detail="CSV file not provided.")
     
     if not csv_file.filename.lower().endswith('.csv'):
         logger.warning(f"Uploaded file doesn't have .csv extension: {csv_file.filename}")
@@ -639,11 +640,11 @@ async def get_prices(
         rows = _sniff_and_read(csv_file.file)
     except Exception as e:
         logger.error(f"Error reading CSV file: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Erro ao ler CSV: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error reading CSV: {str(e)}")
     
     if not rows:
         logger.error("CSV file is empty")
-        raise HTTPException(status_code=400, detail="CSV vazio ou inválido.")
+        raise HTTPException(status_code=400, detail="Empty or invalid CSV file.")
 
     # Validate columns
     fields = list(rows[0].keys())
@@ -661,7 +662,7 @@ async def get_prices(
         logger.error(f"Required columns not found. Available: {fields}")
         raise HTTPException(
             status_code=400, 
-            detail=f"CSV deve ter colunas 'coin' e 'address'. Encontradas: {fields}"
+            detail=f"CSV must have 'coin' and 'address' columns. Found: {fields}"
         )
 
     logger.info(f"Processing {len(rows)} rows from CSV")
@@ -682,7 +683,7 @@ async def get_prices(
         addr_to_id = await map_address_to_cmc_ids(addrs_present, api_key=api_key)
     except Exception as e:
         logger.error(f"Error mapping addresses to CMC IDs: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao mapear endereços: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error mapping addresses: {str(e)}")
 
     # Fallback by symbol (use coin name when no address)
     symbols_needed: List[str] = []
@@ -700,7 +701,7 @@ async def get_prices(
         sym_to_id = await map_symbol_to_cmc_ids(symbols_needed, api_key=api_key)
     except Exception as e:
         logger.error(f"Error mapping symbols to CMC IDs: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao mapear símbolos: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error mapping symbols: {str(e)}")
 
     # Resolve CMC IDs
     cmc_ids: List[Optional[int]] = []
@@ -722,20 +723,20 @@ async def get_prices(
         id_to_price = await fetch_prices_for_ids(unique_ids, date_end_utc=dt_target, api_key=api_key)
     except Exception as e:
         logger.error(f"Error fetching prices: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao buscar preços: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching prices: {str(e)}")
 
-    # Identifica endereços que não obtiveram preço (podem ser DEX pairs)
+    # Identify addresses that didn't get a price (may be DEX pairs)
     addresses_without_price: List[str] = []
     addr_to_idx: Dict[str, int] = {}
     
     for idx, (coin, addr, cmc_id) in enumerate(zip(coins, addresses, cmc_ids)):
         if addr and _valid_address(addr):
-            # Se não tem CMC ID OU tem ID mas não tem preço, tenta DEX
+            # If no CMC ID OR has ID but no price, try DEX
             if cmc_id is None or id_to_price.get(cmc_id) is None:
                 addresses_without_price.append(addr)
                 addr_to_idx[_normalize(addr)] = idx
     
-    # Tenta buscar via DEX API para endereços sem preço
+    # Try to fetch via DEX API for addresses without price
     dex_prices: Dict[str, Optional[float]] = {}
     if addresses_without_price:
         logger.info(f"Trying DEX API for {len(addresses_without_price)} addresses without price")
@@ -750,21 +751,21 @@ async def get_prices(
             # Continua mesmo se DEX falhar
 
     # Monta resultado combinando cryptoasset + DEX prices
-    # Novo formato: (coin, address, price)
+    # New format: (coin, address, price)
     result_data: List[Tuple[str, str, Optional[float]]] = []
     for coin, addr, cmc_id in zip(coins, addresses, cmc_ids):
-        # Prioridade: 1) Preço via CMC ID, 2) Preço via DEX, 3) None
+        # Priority: 1) Price via CMC ID, 2) Price via DEX, 3) None
         price = None
         if cmc_id is not None:
             price = id_to_price.get(cmc_id)
         
-        # Se não tem preço via ID, tenta DEX
+        # If no price via ID, try DEX
         if price is None and addr and _normalize(addr) in dex_prices:
             price = dex_prices.get(_normalize(addr))
         
         result_data.append((coin, addr or "", price))
 
-    # Gera CSV com novo formato: coin, address, price_usd_YYYY-MM-DD
+    # Generate CSV with new format: coin, address, price_usd_YYYY-MM-DD
     buf = _build_output_csv(result_data, target_date=target_date)
     
     # Save to output folder
@@ -777,7 +778,7 @@ async def get_prices(
     output_file.write_bytes(csv_bytes)
     logger.info(f"Saved output to {output_file}")
     
-    # Retorna Response completa (não streaming) para curl mostrar progresso correto
+    # Return complete Response (non-streaming) for curl to show correct progress
     return Response(
         content=csv_bytes,
         media_type="text/csv",
@@ -791,7 +792,7 @@ async def get_prices_debug(
     target_date: str = Form("2025-10-31"),
     api_key: Optional[str] = Form(None),
 ):
-    """Endpoint de debug: retorna JSON com detalhes completos de processamento"""
+    """Debug endpoint: returns JSON with complete processing details"""
     logger.info(f"Processing debug request for date: {target_date}")
     
     try:
@@ -809,22 +810,22 @@ async def get_prices_debug(
         if dt_target > now:
             raise HTTPException(
                 status_code=400,
-                detail=f"Data {target_date} está no futuro. Use uma data passada (máximo: {now.date().isoformat()})."
+                detail=f"Date {target_date} is in the future. Use a past date (maximum: {now.date().isoformat()})."
             )
     except ValueError:
         logger.error(f"Invalid date format in debug: {target_date}")
-        raise HTTPException(status_code=400, detail="Data inválida. Use YYYY-MM-DD.")
+        raise HTTPException(status_code=400, detail="Invalid date. Use YYYY-MM-DD format.")
 
     # Read and validate CSV
     try:
         rows = _sniff_and_read(csv_file.file)
     except Exception as e:
         logger.error(f"Error reading CSV in debug: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Erro ao ler CSV: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error reading CSV: {str(e)}")
     
     if not rows:
         logger.error("CSV is empty in debug endpoint")
-        raise HTTPException(status_code=400, detail="CSV vazio.")
+        raise HTTPException(status_code=400, detail="CSV file is empty.")
 
     fields = list(rows[0].keys())
     coin_col = None
@@ -839,7 +840,7 @@ async def get_prices_debug(
     
     if not coin_col or not address_col:
         logger.error(f"Required columns missing in debug. Found: {fields}")
-        raise HTTPException(status_code=400, detail=f"Colunas esperadas: 'coin' e 'address'. Encontradas: {fields}")
+        raise HTTPException(status_code=400, detail=f"Expected columns: 'coin' and 'address'. Found: {fields}")
 
     coins: List[str] = []
     addresses: List[Optional[str]] = []
@@ -856,7 +857,7 @@ async def get_prices_debug(
         addr_to_id = await map_address_to_cmc_ids(addrs_present, api_key=api_key)
     except Exception as e:
         logger.error(f"Error in address mapping during debug: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao mapear endereços: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error mapping addresses: {str(e)}")
 
     symbols_needed: List[str] = []
     idx_to_symbol: Dict[int, str] = {}
@@ -870,7 +871,7 @@ async def get_prices_debug(
         sym_to_id = await map_symbol_to_cmc_ids(symbols_needed, api_key=api_key)
     except Exception as e:
         logger.error(f"Error in symbol mapping during debug: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao mapear símbolos: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error mapping symbols: {str(e)}")
 
     cmc_ids: List[Optional[int]] = []
     for idx, (coin, addr) in enumerate(zip(coins, addresses)):
@@ -889,9 +890,9 @@ async def get_prices_debug(
         id_to_price = await fetch_prices_for_ids(unique_ids, date_end_utc=dt_target, api_key=api_key)
     except Exception as e:
         logger.error(f"Error fetching prices in debug: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao buscar preços: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching prices: {str(e)}")
 
-    # Tenta DEX para endereços sem preço
+    # Try DEX for addresses without price
     addresses_without_price = []
     for addr, cid in zip(addresses, cmc_ids):
         if addr and _valid_address(addr):
@@ -914,7 +915,7 @@ async def get_prices_debug(
         via_address = bool(addr and _normalize(addr) in addr_to_id)
         via_symbol = bool(cid and not via_address)
         
-        # Preço: tenta CMC ID primeiro, depois DEX
+        # Price: try CMC ID first, then DEX
         price_val = id_to_price.get(cid) if cid is not None else None
         via_dex = False
         
@@ -958,3 +959,119 @@ async def get_prices_debug(
     }
     
     return JSONResponse({"summary": summary, "rows": debug_rows[:200]})
+
+
+@app.get("/test/price/{cmc_id}")
+async def test_price_endpoint(
+    cmc_id: int,
+    target_date: str = "2025-10-31",
+    api_key: Optional[str] = None,
+):
+    """
+    Test endpoint to check what exact data we're getting from CMC API
+    Returns raw API responses for debugging date/price issues
+    """
+    logger.info(f"Testing price fetch for CMC ID {cmc_id} on date {target_date}")
+    
+    try:
+        api_key = api_key or _env_api_key()
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    # Parse target date
+    try:
+        dt_target = datetime.fromisoformat(target_date).replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    
+    # Prepare date range (entire day in UTC)
+    time_start = datetime(dt_target.year, dt_target.month, dt_target.day, 0, 0, 0, tzinfo=timezone.utc)
+    time_end = datetime(dt_target.year, dt_target.month, dt_target.day, 23, 59, 59, tzinfo=timezone.utc)
+    
+    headers = {"X-CMC_PRO_API_KEY": api_key}
+    test_results = {
+        "cmc_id": cmc_id,
+        "target_date": target_date,
+        "target_date_parsed": dt_target.isoformat(),
+        "time_start": time_start.isoformat(),
+        "time_end": time_end.isoformat(),
+        "quotes_endpoint": {},
+        "ohlcv_endpoint": {},
+    }
+    
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        # Test 1: Quotes/historical endpoint
+        params_quotes = {
+            "id": str(cmc_id),
+            "time_start": time_start.isoformat(),
+            "time_end": time_end.isoformat(),
+            "interval": "daily",
+            "convert": "USD",
+        }
+        
+        logger.info(f"Testing quotes endpoint with params: {params_quotes}")
+        
+        try:
+            await _rate_limit()
+            resp_quotes = await client.get(
+                f"{CMC_BASE}/v2/cryptocurrency/quotes/historical",
+                headers=headers,
+                params=params_quotes
+            )
+            resp_quotes.raise_for_status()
+            quotes_data = resp_quotes.json()
+            
+            test_results["quotes_endpoint"] = {
+                "url": str(resp_quotes.url),
+                "status": resp_quotes.status_code,
+                "data": quotes_data,
+                "extracted_price": None
+            }
+            
+            # Try to extract price
+            quotes = quotes_data.get("data", {}).get(str(cmc_id), {}).get("quotes") or []
+            extracted = _extract_price_from_quotes(quotes, dt_target.date())
+            test_results["quotes_endpoint"]["extracted_price"] = extracted
+            
+        except Exception as e:
+            test_results["quotes_endpoint"]["error"] = str(e)
+            logger.error(f"Quotes endpoint error: {e}")
+        
+        # Test 2: OHLCV/historical endpoint
+        params_ohlcv = {
+            "id": str(cmc_id),
+            "time_start": time_start.date().isoformat(),
+            "time_end": time_end.date().isoformat(),
+            "convert": "USD",
+            "interval": "daily",
+        }
+        
+        logger.info(f"Testing OHLCV endpoint with params: {params_ohlcv}")
+        
+        try:
+            await _rate_limit()
+            resp_ohlcv = await client.get(
+                f"{CMC_BASE}/v1/cryptocurrency/ohlcv/historical",
+                headers=headers,
+                params=params_ohlcv
+            )
+            resp_ohlcv.raise_for_status()
+            ohlcv_data = resp_ohlcv.json()
+            
+            test_results["ohlcv_endpoint"] = {
+                "url": str(resp_ohlcv.url),
+                "status": resp_ohlcv.status_code,
+                "data": ohlcv_data,
+                "extracted_price": None
+            }
+            
+            # Try to extract price
+            series = ohlcv_data.get("data", {}).get(str(cmc_id), {}).get("quotes") or []
+            extracted = _extract_close_from_ohlcv(series, dt_target.date())
+            test_results["ohlcv_endpoint"]["extracted_price"] = extracted
+            
+        except Exception as e:
+            test_results["ohlcv_endpoint"]["error"] = str(e)
+            logger.error(f"OHLCV endpoint error: {e}")
+    
+    return JSONResponse(test_results)
