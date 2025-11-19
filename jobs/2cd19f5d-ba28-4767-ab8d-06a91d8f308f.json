@@ -1,0 +1,12 @@
+{
+  "status": "completed",
+  "progress": 100,
+  "total_rows": 3487426,
+  "unique_symbols": 65,
+  "symbols_with_prices": 55,
+  "current_step": "Completed",
+  "started_at": "2025-11-19T20:31:31.906269+00:00",
+  "completed_at": "2025-11-19T20:33:09.287795+00:00",
+  "output_file": "output\\batch_2cd19f5d-ba28-4767-ab8d-06a91d8f308f_2025-10-31.csv",
+  "error": null
+}

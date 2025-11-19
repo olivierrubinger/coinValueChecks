@@ -30,6 +30,9 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from pathlib import Path
+import pandas as pd
+import uuid
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -582,6 +585,192 @@ async def healthz():
     return JSONResponse({"status": "ok", "version": "2.0.0"})
 
 
+# ============================================================================
+# BATCH PROCESSING - Background jobs for large CSV files
+# ============================================================================
+
+# In-memory job storage (in production, use Redis or database)
+batch_jobs: Dict[str, dict] = {}
+JOBS_DIR = Path("jobs")
+JOBS_DIR.mkdir(exist_ok=True)
+
+
+def _save_job_status(job_id: str, status: dict):
+    """Saves job status to disk for persistence"""
+    job_file = JOBS_DIR / f"{job_id}.json"
+    with open(job_file, 'w') as f:
+        json.dump(status, f, indent=2, default=str)
+    batch_jobs[job_id] = status
+
+
+def _load_job_status(job_id: str) -> Optional[dict]:
+    """Loads job status from disk"""
+    if job_id in batch_jobs:
+        return batch_jobs[job_id]
+    
+    job_file = JOBS_DIR / f"{job_id}.json"
+    if job_file.exists():
+        with open(job_file, 'r') as f:
+            status = json.load(f)
+            batch_jobs[job_id] = status
+            return status
+    return None
+
+
+async def _process_batch_symbols(
+    job_id: str,
+    csv_path: Path,
+    target_date: str,
+    api_key: str,
+    chunk_size: int = 100000
+):
+    """
+    Processes large CSV file in chunks to extract symbols and fetch prices.
+    Updates job status as it progresses.
+    """
+    try:
+        _save_job_status(job_id, {
+            "status": "processing",
+            "progress": 0,
+            "total_rows": 0,
+            "unique_symbols": 0,
+            "symbols_with_prices": 0,
+            "current_step": "Reading CSV and extracting symbols",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "error": None
+        })
+        
+        # Step 1: Read CSV in chunks and extract unique symbols
+        logger.info(f"[Job {job_id}] Starting to read CSV in chunks of {chunk_size}")
+        unique_symbols = set()
+        total_rows = 0
+        
+        try:
+            # Read CSV in chunks to avoid loading everything in memory
+            for chunk_num, chunk in enumerate(pd.read_csv(csv_path, chunksize=chunk_size)):
+                if 'denomination' not in chunk.columns:
+                    raise ValueError("CSV must have 'denomination' column")
+                
+                # Extract symbols from this chunk
+                symbols_in_chunk = chunk['denomination'].dropna().astype(str).str.strip().str.upper()
+                unique_symbols.update(symbols_in_chunk.unique())
+                total_rows += len(chunk)
+                
+                # Update progress
+                _save_job_status(job_id, {
+                    **batch_jobs[job_id],
+                    "progress": min(50, (chunk_num + 1) * 10),  # First 50% is reading
+                    "total_rows": total_rows,
+                    "unique_symbols": len(unique_symbols),
+                    "current_step": f"Reading chunk {chunk_num + 1} ({total_rows:,} rows processed)"
+                })
+                
+                logger.info(f"[Job {job_id}] Processed chunk {chunk_num + 1}: {total_rows:,} total rows, {len(unique_symbols)} unique symbols")
+        
+        except Exception as e:
+            logger.error(f"[Job {job_id}] Error reading CSV: {str(e)}")
+            raise ValueError(f"Error reading CSV: {str(e)}")
+        
+        # Remove empty symbols
+        unique_symbols = {s for s in unique_symbols if s and s not in ('', 'NAN', 'NONE', 'NULL')}
+        symbols_list = sorted(unique_symbols)
+        
+        logger.info(f"[Job {job_id}] Extracted {len(symbols_list)} unique symbols from {total_rows:,} rows")
+        
+        _save_job_status(job_id, {
+            **batch_jobs[job_id],
+            "progress": 50,
+            "total_rows": total_rows,
+            "unique_symbols": len(symbols_list),
+            "current_step": "Mapping symbols to CMC IDs"
+        })
+        
+        # Step 2: Map symbols to CMC IDs
+        logger.info(f"[Job {job_id}] Mapping {len(symbols_list)} symbols to CMC IDs")
+        
+        try:
+            dt_target = datetime.fromisoformat(target_date).replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise ValueError("Invalid target_date. Use YYYY-MM-DD format.")
+        
+        sym_to_id = await map_symbol_to_cmc_ids(symbols_list, api_key=api_key)
+        
+        _save_job_status(job_id, {
+            **batch_jobs[job_id],
+            "progress": 70,
+            "current_step": "Fetching historical prices"
+        })
+        
+        # Step 3: Fetch prices for all CMC IDs
+        unique_ids = sorted(set(sym_to_id.values()))
+        logger.info(f"[Job {job_id}] Fetching prices for {len(unique_ids)} CMC IDs")
+        
+        id_to_price = await fetch_prices_for_ids(unique_ids, date_end_utc=dt_target, api_key=api_key)
+        
+        _save_job_status(job_id, {
+            **batch_jobs[job_id],
+            "progress": 90,
+            "current_step": "Generating output CSV"
+        })
+        
+        # Step 4: Build output CSV
+        output_data: List[Tuple[str, Optional[float]]] = []
+        symbols_with_prices = 0
+        
+        for symbol in symbols_list:
+            cmc_id = sym_to_id.get(_normalize(symbol.upper()))
+            price = id_to_price.get(cmc_id) if cmc_id else None
+            output_data.append((symbol, price))
+            if price is not None:
+                symbols_with_prices += 1
+        
+        # Generate CSV
+        output_dir = Path("output")
+        output_dir.mkdir(exist_ok=True)
+        output_file = output_dir / f"batch_{job_id}_{target_date}.csv"
+        
+        buf = StringIO()
+        writer = csv.writer(buf, lineterminator='\n')
+        
+        # Header
+        price_column = f"price_usd_{target_date}"
+        writer.writerow(["coin", price_column])
+        
+        # Data
+        for symbol, price in output_data:
+            price_str = "N/A" if price is None else f"{price:.10f}".rstrip("0").rstrip(".")
+            writer.writerow([symbol, price_str])
+        
+        # Save to file
+        output_file.write_text(buf.getvalue(), encoding='utf-8')
+        
+        logger.info(f"[Job {job_id}] Completed! Output saved to {output_file}")
+        
+        # Mark as completed
+        _save_job_status(job_id, {
+            "status": "completed",
+            "progress": 100,
+            "total_rows": total_rows,
+            "unique_symbols": len(symbols_list),
+            "symbols_with_prices": symbols_with_prices,
+            "current_step": "Completed",
+            "started_at": batch_jobs[job_id]["started_at"],
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "output_file": str(output_file),
+            "error": None
+        })
+        
+    except Exception as e:
+        logger.error(f"[Job {job_id}] Failed with error: {str(e)}")
+        _save_job_status(job_id, {
+            **batch_jobs.get(job_id, {}),
+            "status": "failed",
+            "current_step": "Failed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(e)
+        })
+
+
 @app.get("/config")
 async def get_config():
     """Returns current configuration (without sensitive data)"""
@@ -594,6 +783,215 @@ async def get_config():
         "request_timeout_seconds": REQUEST_TIMEOUT,
         "log_level": LOG_LEVEL,
         "api_key_configured": bool(os.getenv(CMC_API_KEY_ENV))
+    })
+
+
+@app.post("/prices/batch")
+async def submit_batch_job(
+    csv_file: UploadFile = File(..., description="Large CSV with 'denomination' column"),
+    target_date: str = Form("2025-10-31", description="Target date (YYYY-MM-DD)"),
+):
+    """
+    Submit a batch job to process large CSV files (up to 1.5M rows).
+    Returns a job_id to track progress.
+    
+    The CSV must have a 'denomination' column with coin symbols (ETH, SOL, XRP, etc).
+    Processing happens in background. Use GET /prices/batch/{job_id} to check status.
+    """
+    logger.info(f"Received batch job request for date: {target_date}")
+    
+    try:
+        api_key = _env_api_key()
+    except RuntimeError as e:
+        logger.error(f"API key error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    # Validate date
+    try:
+        dt_target = datetime.fromisoformat(target_date).replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        if dt_target > now:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Date {target_date} is in the future. Use a past date."
+            )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date. Use YYYY-MM-DD format.")
+    
+    # Validate file
+    if not csv_file.filename or not csv_file.filename.lower().endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Please upload a CSV file.")
+    
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+    
+    # Save uploaded file temporarily
+    temp_dir = Path("temp")
+    temp_dir.mkdir(exist_ok=True)
+    temp_file = temp_dir / f"{job_id}.csv"
+    
+    try:
+        # Save uploaded file
+        content = await csv_file.read()
+        temp_file.write_bytes(content)
+        logger.info(f"[Job {job_id}] Saved uploaded file: {len(content):,} bytes")
+        
+        # Initialize job status
+        _save_job_status(job_id, {
+            "status": "queued",
+            "progress": 0,
+            "total_rows": 0,
+            "unique_symbols": 0,
+            "symbols_with_prices": 0,
+            "current_step": "Queued for processing",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "target_date": target_date,
+            "original_filename": csv_file.filename,
+            "error": None
+        })
+        
+        # Start background processing
+        asyncio.create_task(_process_batch_symbols(job_id, temp_file, target_date, api_key))
+        
+        logger.info(f"[Job {job_id}] Started background processing")
+        
+        return JSONResponse({
+            "job_id": job_id,
+            "status": "queued",
+            "message": "Batch job submitted successfully. Use GET /prices/batch/{job_id} to check progress.",
+            "status_url": f"/prices/batch/{job_id}"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error submitting batch job: {str(e)}")
+        if temp_file.exists():
+            temp_file.unlink()
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+
+
+@app.get("/prices/batch/{job_id}")
+async def get_batch_job_status(job_id: str):
+    """
+    Get the status and progress of a batch job.
+    
+    Returns:
+    - status: queued, processing, completed, or failed
+    - progress: 0-100%
+    - current_step: description of current operation
+    - output_file: download path when completed
+    """
+    status = _load_job_status(job_id)
+    
+    if not status:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    return JSONResponse(status)
+
+
+@app.get("/prices/batch/{job_id}/download")
+async def download_batch_result(job_id: str):
+    """
+    Download the result CSV file for a completed batch job.
+    """
+    status = _load_job_status(job_id)
+    
+    if not status:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    if status["status"] != "completed":
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Job is not completed yet. Current status: {status['status']}"
+        )
+    
+    output_file = Path(status["output_file"])
+    
+    if not output_file.exists():
+        raise HTTPException(status_code=404, detail="Output file not found")
+    
+    csv_content = output_file.read_bytes()
+    
+    return Response(
+        content=csv_content,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{output_file.name}"'
+        }
+    )
+
+
+@app.get("/prices/batch")
+async def list_batch_jobs():
+    """
+    List all batch jobs with their current status.
+    """
+    all_jobs = []
+    
+    # Load all job files
+    for job_file in JOBS_DIR.glob("*.json"):
+        job_id = job_file.stem
+        status = _load_job_status(job_id)
+        if status:
+            all_jobs.append({
+                "job_id": job_id,
+                "status": status.get("status"),
+                "progress": status.get("progress", 0),
+                "total_rows": status.get("total_rows", 0),
+                "unique_symbols": status.get("unique_symbols", 0),
+                "symbols_with_prices": status.get("symbols_with_prices", 0),
+                "created_at": status.get("created_at"),
+                "completed_at": status.get("completed_at"),
+                "target_date": status.get("target_date"),
+                "original_filename": status.get("original_filename"),
+            })
+    
+    # Sort by creation date (newest first)
+    all_jobs.sort(key=lambda x: x.get("created_at") or x.get("started_at") or "", reverse=True)
+    
+    return JSONResponse({
+        "total_jobs": len(all_jobs),
+        "jobs": all_jobs
+    })
+
+
+@app.delete("/prices/batch/{job_id}")
+async def delete_batch_job(job_id: str):
+    """
+    Delete/cancel a batch job and its associated files.
+    Useful for cleaning up stuck or failed jobs.
+    """
+    status = _load_job_status(job_id)
+    
+    if not status:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    # Delete job status file
+    job_file = JOBS_DIR / f"{job_id}.json"
+    if job_file.exists():
+        job_file.unlink()
+        logger.info(f"Deleted job file: {job_file}")
+    
+    # Delete temp file
+    temp_file = Path("temp") / f"{job_id}.csv"
+    if temp_file.exists():
+        temp_file.unlink()
+        logger.info(f"Deleted temp file: {temp_file}")
+    
+    # Delete output file if exists
+    if status.get("output_file"):
+        output_file = Path(status["output_file"])
+        if output_file.exists():
+            output_file.unlink()
+            logger.info(f"Deleted output file: {output_file}")
+    
+    # Remove from memory
+    if job_id in batch_jobs:
+        del batch_jobs[job_id]
+    
+    return JSONResponse({
+        "message": f"Job {job_id} deleted successfully",
+        "job_id": job_id,
+        "previous_status": status.get("status")
     })
 
 
