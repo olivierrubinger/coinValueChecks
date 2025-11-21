@@ -44,7 +44,9 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Crypto Price Extractor",
     version="2.0.0",
-    description="Reads CSV with 'coin' and 'address' columns, fetches prices from CMC and returns CSV."
+    description="Reads CSV with 'coin' and 'address' columns, fetches prices from CMC and returns CSV.",
+    # Increase max request body size to 5GB for large CSV uploads
+    max_request_size=5 * 1024 * 1024 * 1024  # 5GB
 )
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
@@ -647,6 +649,7 @@ async def _process_batch_symbols(
         
         try:
             # Read CSV in chunks to avoid loading everything in memory
+            total_chunks = None  # Will be estimated after first chunk
             for chunk_num, chunk in enumerate(pd.read_csv(csv_path, chunksize=chunk_size)):
                 if 'denomination' not in chunk.columns:
                     raise ValueError("CSV must have 'denomination' column")
@@ -656,16 +659,32 @@ async def _process_batch_symbols(
                 unique_symbols.update(symbols_in_chunk.unique())
                 total_rows += len(chunk)
                 
+                # Estimate total chunks after first chunk (for progress calculation)
+                if total_chunks is None and chunk_num == 0:
+                    # Estimate file size and total chunks
+                    file_size = csv_path.stat().st_size
+                    # Rough estimate: assume each chunk is similar size
+                    bytes_per_row = file_size / len(chunk) if len(chunk) > 0 else 1
+                    estimated_total_rows = file_size / bytes_per_row
+                    total_chunks = max(1, int(estimated_total_rows / chunk_size))
+                    logger.info(f"[Job {job_id}] Estimated {total_chunks} chunks (~{estimated_total_rows:,.0f} rows)")
+                
+                # Calculate progress: 0-50% for reading CSV
+                if total_chunks:
+                    read_progress = min(50, int((chunk_num + 1) / total_chunks * 50))
+                else:
+                    read_progress = min(50, (chunk_num + 1) * 5)  # Fallback
+                
                 # Update progress
                 _save_job_status(job_id, {
                     **batch_jobs[job_id],
-                    "progress": min(50, (chunk_num + 1) * 10),  # First 50% is reading
+                    "progress": read_progress,
                     "total_rows": total_rows,
                     "unique_symbols": len(unique_symbols),
-                    "current_step": f"Reading chunk {chunk_num + 1} ({total_rows:,} rows processed)"
+                    "current_step": f"Reading chunk {chunk_num + 1}/{total_chunks or '?'} ({total_rows:,} rows processed)"
                 })
                 
-                logger.info(f"[Job {job_id}] Processed chunk {chunk_num + 1}: {total_rows:,} total rows, {len(unique_symbols)} unique symbols")
+                logger.info(f"[Job {job_id}] Processed chunk {chunk_num + 1}/{total_chunks or '?'}: {total_rows:,} total rows, {len(unique_symbols)} unique symbols")
         
         except Exception as e:
             logger.error(f"[Job {job_id}] Error reading CSV: {str(e)}")
